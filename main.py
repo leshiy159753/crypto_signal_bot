@@ -1,1 +1,131 @@
-"""\nMain entry point for the Crypto Signal Bot.\nAPScheduler loop monitors all symbols and timeframes.\nAiogram Dispatcher handles /start, /scan, /status commands.\n"""\n\nimport asyncio\nimport logging\nimport datetime\n\nfrom apscheduler.schedulers.asyncio import AsyncIOScheduler\nfrom aiogram import Dispatcher\nfrom aiogram.filters import Command\nfrom aiogram.types import Message\nfrom aiogram.enums import ParseMode\n\nimport config\nfrom fetcher import fetch_ohlcv\nfrom indicators import add_indicators\nfrom signals import check_signals, format_signal\nfrom bot import send_signal, get_bot\n\nlogging.basicConfig(\n    level=logging.INFO,\n    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",\n)\nlogger = logging.getLogger(__name__)\n\ndp = Dispatcher()\n_start_time = datetime.datetime.now()\n\n\nasync def scan_pair(symbol: str, timeframe: str) -> list:\n    df = fetch_ohlcv(symbol, timeframe, limit=500)\n    df = add_indicators(\n        df,\n        rsi_period=config.RSI_PERIOD,\n        ema_fast=config.EMA_FAST,\n        ema_mid=config.EMA_MID,\n        ema_slow=config.EMA_SLOW,\n    )\n    signals = check_signals(df, symbol, timeframe)\n    return [format_signal(sig) for sig in signals] if signals else []\n\n\nasync def scan_all() -> None:\n    for timeframe in config.TIMEFRAMES:\n        for symbol in config.SYMBOLS:\n            try:\n                logger.info(f"Scanning {symbol} / {timeframe}")\n                texts = await scan_pair(symbol, timeframe)\n                for text in texts:\n                    logger.info(f"Signal found: {symbol} {timeframe}")\n                    await send_signal(text)\n                if not texts:\n                    logger.debug(f"No signal for {symbol} {timeframe}")\n            except Exception as e:\n                logger.error(f"Error scanning {symbol}/{timeframe}: {e}")\n\n\n@dp.message(Command("start"))\nasync def cmd_start(message: Message) -> None:\n    symbols = ", ".join(config.SYMBOLS)\n    timeframes = ", ".join(config.TIMEFRAMES)\n    await message.answer(\n        f"<b>Crypto Signal Bot</b> aktiven\\n\\n"\n        f"Pary: <code>{symbols}</code>\\n"\n        f"Tajmfrejmy: <code>{timeframes}</code>\\n\\n"\n        f"Komandy:\\n"\n        f"/scan - ruchnoe skanirovanie vsekh par\\n"\n        f"/status - status bota",\n        parse_mode=ParseMode.HTML,\n    )\n\n\n@dp.message(Command("scan"))\nasync def cmd_scan(message: Message) -> None:\n    await message.answer("Skaniruyu vse pary... podozhdite")\n    found = 0\n    for timeframe in config.TIMEFRAMES:\n        for symbol in config.SYMBOLS:\n            try:\n                texts = await scan_pair(symbol, timeframe)\n                for text in texts:\n                    await message.answer(text, parse_mode=ParseMode.HTML)\n                    found += 1\n            except Exception as e:\n                await message.answer(f"Oshibka {symbol}/{timeframe}: {e}")\n    if found == 0:\n        await message.answer("Signalov net - rynok nejtralen")\n    else:\n        await message.answer(f"Gotovo. Najdeno signalov: <b>{found}</b>", parse_mode=ParseMode.HTML)\n\n\n@dp.message(Command("status"))\nasync def cmd_status(message: Message) -> None:\n    uptime = datetime.datetime.now() - _start_time\n    hours, remainder = divmod(int(uptime.total_seconds()), 3600)\n    minutes = remainder // 60\n    symbols = ", ".join(config.SYMBOLS)\n    timeframes = ", ".join(config.TIMEFRAMES)\n    await message.answer(\n        f"<b>Status</b>\\n\\n"\n        f"Uptime: <code>{hours}h {minutes}m</code>\\n"\n        f"Pary: <code>{symbols}</code>\\n"\n        f"Tajmfrejmy: <code>{timeframes}</code>\\n"\n        f"Status: OK",\n        parse_mode=ParseMode.HTML,\n    )\n\n\nasync def main() -> None:\n    bot = get_bot()\n\n    scheduler = AsyncIOScheduler()\n    for timeframe in config.TIMEFRAMES:\n        interval_seconds = config.POLL_INTERVAL.get(timeframe, 300)\n        scheduler.add_job(\n            scan_all,\n            "interval",\n            seconds=interval_seconds,\n            id=f"scan_{timeframe}",\n            next_run_time=datetime.datetime.now(),\n        )\n\n    scheduler.start()\n    logger.info("Bot started. Monitoring: %s on %s", config.SYMBOLS, config.TIMEFRAMES)\n\n    await dp.start_polling(bot)\n\n\nif __name__ == "__main__":\n    asyncio.run(main())\n
+"""
+Main entry point for the Crypto Signal Bot.
+APScheduler loop monitors all symbols and timeframes.
+Aiogram Dispatcher handles /start, /scan, /status commands.
+"""
+
+import asyncio
+import logging
+import datetime
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram import Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.enums import ParseMode
+
+import config
+from fetcher import fetch_ohlcv
+from indicators import add_indicators
+from signals import check_signals, format_signal
+from bot import send_signal, get_bot
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+dp = Dispatcher()
+_start_time = datetime.datetime.now(datetime.timezone.utc)
+
+
+async def scan_pair(symbol: str, timeframe: str) -> list:
+    df = fetch_ohlcv(symbol, timeframe, limit=500)
+    df = add_indicators(
+        df,
+        rsi_period=config.RSI_PERIOD,
+        ema_period=config.EMA_PERIOD,
+    )
+    signals = check_signals(df, symbol, timeframe)
+    return signals
+
+
+async def run_scan(notify: bool = True) -> list:
+    """Scan all pairs/timeframes. If notify=True, send signals to Telegram."""
+    all_signals = []
+    for symbol in config.SYMBOLS:
+        for tf in config.TIMEFRAMES:
+            logger.info(f"Scanning {symbol} / {tf}")
+            try:
+                signals = await scan_pair(symbol, tf)
+                all_signals.extend(signals)
+                if notify:
+                    for sig in signals:
+                        msg = format_signal(sig)
+                        await send_signal(msg)
+            except Exception as e:
+                logger.error(f"Error scanning {symbol}/{tf}: {e}")
+    return all_signals
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    pairs = ", ".join(config.SYMBOLS)
+    tfs = ", ".join(config.TIMEFRAMES)
+    text = (
+        f"Crypto Signal Bot running!\n"
+        f"Pairs: {pairs}\n"
+        f"Timeframes: {tfs}\n\n"
+        f"Commands:\n"
+        f"/scan — run scan now\n"
+        f"/status — bot uptime"
+    )
+    await message.answer(text)
+
+
+@dp.message(Command("scan"))
+async def cmd_scan(message: Message):
+    await message.answer("Scanning all pairs... please wait.")
+    signals = await run_scan(notify=False)
+    if not signals:
+        await message.answer("No signals found. Market is neutral.")
+    else:
+        for sig in signals:
+            await message.answer(format_signal(sig), parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    uptime = datetime.datetime.now(datetime.timezone.utc) - _start_time
+    hours, rem = divmod(int(uptime.total_seconds()), 3600)
+    minutes = rem // 60
+    pairs = ", ".join(config.SYMBOLS)
+    tfs = ", ".join(config.TIMEFRAMES)
+    text = (
+        f"Bot uptime: {hours}h {minutes}m\n"
+        f"Monitoring: {pairs}\n"
+        f"Timeframes: {tfs}"
+    )
+    await message.answer(text)
+
+
+async def main():
+    bot = get_bot()
+
+    scheduler = AsyncIOScheduler()
+    interval_map = {
+        "15m": 15, "1h": 60, "4h": 240,
+        "1d": 1440, "1w": 10080, "1M": 43200,
+    }
+    for symbol in config.SYMBOLS:
+        for tf in config.TIMEFRAMES:
+            minutes = interval_map.get(tf, 60)
+            scheduler.add_job(
+                run_scan,
+                "interval",
+                minutes=minutes,
+                kwargs={"notify": True},
+                id=f"scan_{symbol}_{tf}",
+            )
+
+    scheduler.start()
+    logger.info(
+        f"Bot started. Monitoring: {config.SYMBOLS} on {config.TIMEFRAMES}"
+    )
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
